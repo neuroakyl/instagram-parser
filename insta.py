@@ -2,6 +2,7 @@
 
   python3 insta.py сбор <ник> [--limit 50] [--newer 2026-01-01] [--out папка]
   python3 insta.py звук <папка>        # если reels.json положил коннектор Apify, а не сбор
+  python3 insta.py telegram <папка>    # видео, пересланные своему боту → текст → корпус (TELEGRAM_BOT_TOKEN)
   python3 insta.py текст <папка> [--model gemini-3.5-flash]
   python3 insta.py корпус <папка>
   python3 insta.py всё <ник> [--limit 50] [--out папка]
@@ -99,6 +100,49 @@ def download(out, items=None):
     print(f"Звук: {len(items) - bad} ок" + (f", {bad} не скачались (ссылки протухли — собери заново)" if bad else ""))
 
 
+# ---------- 1б. Telegram: видео, пересланные боту ----------
+def telegram(out):
+    """Забирает видео, которые человек переслал своему боту. Сервер не нужен: Telegram хранит сообщения боту 24 часа,
+    поэтому пересылать и забирать надо в один день. Лимит Telegram для ботов — 20 МБ на файл."""
+    out = pathlib.Path(out); (out / "звук").mkdir(parents=True, exist_ok=True)
+    (out / ".gitignore").write_text("звук/\n")
+    token = key("TELEGRAM_BOT_TOKEN"); api = f"https://api.telegram.org/bot{token}"
+    items = {i["shortCode"]: i for i in json.loads((out / "reels.json").read_text())} if (out / "reels.json").exists() else {}
+    offset, got, big = None, 0, 0
+    while True:
+        try:
+            res = json.loads(http(f"{api}/getUpdates?timeout=0&limit=100" + (f"&offset={offset}" if offset else "")))["result"]
+        except urllib.error.HTTPError as e:
+            sys.exit("Telegram: " + ("у бота стоит webhook, сними его (deleteWebhook)" if e.code == 409 else f"ошибка {e.code}, проверь токен"))
+        if not res:
+            break
+        for u in res:
+            offset = u["update_id"] + 1
+            m = u.get("message") or u.get("channel_post") or {}
+            doc = m.get("document") or {}
+            v = m.get("video") or m.get("video_note") or (doc if doc.get("mime_type", "").startswith("video/") else None)
+            if not v:
+                continue
+            code = "tg" + v["file_unique_id"]
+            if code in items and (out / "звук" / f"{code}.mp4").exists():
+                continue
+            if (v.get("file_size") or 0) > 20 * 2**20:
+                big += 1; continue
+            path = json.loads(http(f"{api}/getFile?file_id={v['file_id']}"))["result"]["file_path"]
+            (out / "звук" / f"{code}.mp4").write_bytes(http(f"https://api.telegram.org/file/bot{token}/{path}", timeout=300))
+            src = m.get("forward_origin") or {}
+            chat = src.get("chat") or {}
+            url = f"https://t.me/{chat['username']}/{src.get('message_id')}" if chat.get("username") else ""
+            items[code] = {"shortCode": code, "url": url, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(src.get("date") or m["date"])),
+                           "videoDuration": v.get("duration") or 0, "caption": m.get("caption") or ""}
+            got += 1
+    (out / "reels.json").write_text(json.dumps(list(items.values()), ensure_ascii=False, indent=1), encoding="utf-8")
+    if offset:   # отметить забранное, чтобы в следующий раз не качать заново
+        http(f"{api}/getUpdates?offset={offset}&limit=1&timeout=0")
+    print(f"Telegram: новых видео {got}, всего в папке {len(items)}" + (f"; {big} больше 20 МБ — пришли их сжатыми" if big else ""))
+    return out
+
+
 # ---------- 2. текст: Gemini дословно ----------
 def gemini(model, mime, raw):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -148,13 +192,16 @@ def corpus(out):
                      "просмотры": i.get("videoPlayCount") or i.get("videoViewCount") or 0, "лайки": i.get("likesCount") or 0,
                      "комменты": i.get("commentsCount") or 0, "секунды": round(i.get("videoDuration") or 0),
                      "подпись": (i.get("caption") or "").strip(), "текст": t.read_text(encoding="utf-8").strip() if t.exists() else ""})
-    rows.sort(key=lambda r: -r["просмотры"])
+    rows.sort(key=lambda r: (-r["просмотры"], r["дата"]))   # из Telegram просмотров нет — тогда по дате
     (out / "корпус.json").write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
     nick = out.name
-    md = [f"# Корпус @{nick}", "", f"{len(rows)} рилсов, по убыванию просмотров. Собрано {time.strftime('%d.%m.%Y')}.", ""]
+    order = "по убыванию просмотров" if any(r["просмотры"] for r in rows) else "по дате"
+    md = [f"# Корпус @{nick}", "", f"{len(rows)} роликов, {order}. Собрано {time.strftime('%d.%m.%Y')}.", ""]
     for n, r in enumerate(rows, 1):
-        md += [f"## {n}. {r['просмотры']:,} просмотров · {r['дата']} · {r['секунды']} с".replace(",", " "),
-               f"{r['ссылка']} · ❤ {r['лайки']} · 💬 {r['комменты']}", "", r["текст"] or "_(нет расшифровки)_", ""]
+        views = f"{r['просмотры']:,} просмотров · ".replace(",", " ") if r["просмотры"] else ""
+        md += [f"## {n}. {views}{r['дата']} · {r['секунды']} с",
+               " · ".join(x for x in (r["ссылка"] or "", f"❤ {r['лайки']} · 💬 {r['комменты']}" if r["просмотры"] else "") if x),
+               "", r["текст"] or "_(нет расшифровки)_", ""]
         if r["подпись"]:
             md += ["**Подпись:** " + r["подпись"].replace("\n", " "), ""]
     (out / "корпус.md").write_text("\n".join(md), encoding="utf-8")
@@ -166,6 +213,8 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 2 else ""
     if cmd == "сбор":
         collect(sys.argv[2], arg("--out"))
+    elif cmd == "telegram":
+        o = telegram(sys.argv[2]); transcribe(o); corpus(o)
     elif cmd == "звук":
         download(sys.argv[2])
     elif cmd == "текст":
